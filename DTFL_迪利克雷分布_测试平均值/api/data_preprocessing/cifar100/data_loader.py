@@ -109,59 +109,208 @@ def load_cifar100_data(datadir):
     return (X_train, y_train, X_test, y_test)
 
 
-def partition_data(dataset, datadir, partition, n_nets, alpha):
-    logging.info("*********partition data***************")
-    X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
-    n_train = X_train.shape[0]
-    # n_test = X_test.shape[0]
+def _calculate_client_class_distributions(y_data, net_dataidx_map, n_classes):
+    n_clients = len(net_dataidx_map)
+    distributions = np.zeros((n_clients, n_classes))
+    for client_id, data_indices in net_dataidx_map.items():
+        client_labels = y_data[data_indices]
+        for class_id in range(n_classes):
+            distributions[client_id, class_id] = np.sum(client_labels == class_id)
+    return distributions
 
-    if partition == "homo":
-        total_num = n_train
-        idxs = np.random.permutation(total_num)
-        batch_idxs = np.array_split(idxs, n_nets)
-        net_dataidx_map = {i: batch_idxs[i] for i in range(n_nets)}
 
-    elif partition == "hetero":
-        min_size = 0
-        K = 100
-        N = y_train.shape[0]
-        logging.info("N = " + str(N))
-        net_dataidx_map = {}
+def _log_data_distribution_statistics(y_data, net_dataidx_map, n_classes, dataset_name):
+    logging.info(f"\n{dataset_name} 数据分布统计:")
 
-        while min_size < 10:
-            idx_batch = [[] for _ in range(n_nets)]
-            # for each class in the dataset
-            for k in range(K):
-                idx_k = np.where(y_train == k)[0]
-                np.random.shuffle(idx_k)
-                proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
-                ## Balance
-                proportions = np.array([p * (len(idx_j) < N / n_nets) for p, idx_j in zip(proportions, idx_batch)])
-                proportions = proportions / proportions.sum()
-                proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-                idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
-                min_size = min([len(idx_j) for idx_j in idx_batch])
+    total_samples = 0
+    class_totals = np.zeros(n_classes)
 
-        for j in range(n_nets):
-            np.random.shuffle(idx_batch[j])
-            net_dataidx_map[j] = idx_batch[j]
+    for client_id, data_indices in net_dataidx_map.items():
+        client_labels = y_data[data_indices]
+        client_total = len(data_indices)
+        total_samples += client_total
 
-    elif partition == "hetero-fix":
-        dataidx_map_file_path = './data_preprocessing/non-iid-distribution/CIFAR100/net_dataidx_map.txt'
-        net_dataidx_map = read_net_dataidx_map(dataidx_map_file_path)
+        class_counts = np.zeros(n_classes)
+        for class_id in range(n_classes):
+            count = np.sum(client_labels == class_id)
+            class_counts[class_id] = count
+            class_totals[class_id] += count
 
-    if partition == "hetero-fix":
-        distribution_file_path = './data_preprocessing/non-iid-distribution/CIFAR100/distribution.txt'
-        traindata_cls_counts = read_data_distribution(distribution_file_path)
+        if client_total > 0:
+            proportions = class_counts / client_total
+            proportions_sorted = np.sort(proportions)
+            n = len(proportions_sorted)
+            cumsum = np.cumsum(proportions_sorted)
+            gini = (n + 1 - 2 * np.sum(cumsum)) / n if n > 0 else 0
+        else:
+            proportions = np.zeros(n_classes)
+            gini = 0
+
+        main_classes = np.where(proportions > 0.02)[0]
+        logging.info(
+            f"  客户端 {client_id}: {client_total} 样本, "
+            f"主要类别(>2%): {main_classes.tolist()}, "
+            f"基尼系数: {gini:.3f}"
+        )
+
+    logging.info(f"  总样本数: {total_samples}")
+    logging.info(f"  每类样本数: {class_totals.astype(int).tolist()}")
+
+
+def _generate_data_distribution_visualization(y_train, train_net_dataidx_map, n_classes):
+    try:
+        import os
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        distributions = _calculate_client_class_distributions(
+            y_train, train_net_dataidx_map, n_classes
+        )
+        proportions = distributions / (distributions.sum(axis=1, keepdims=True) + 1e-12)
+
+        save_dir = "./visualizations"
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, "cifar100_client_class_distribution_train.png")
+
+        fig, ax = plt.subplots(
+            figsize=(max(10, n_classes / 6), max(4, len(train_net_dataidx_map) / 2)),
+            dpi=180,
+        )
+        im = ax.imshow(proportions, aspect="auto", interpolation="nearest", cmap="viridis")
+        ax.set_xlabel("Class")
+        ax.set_ylabel("Client")
+        ax.set_title("CIFAR100 Train Client-Class Distribution")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Proportion")
+
+        plt.tight_layout()
+        plt.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+
+        logging.info(f"CIFAR100 数据分布可视化图表已生成: {out_path}")
+        return proportions
+    except ImportError as e:
+        logging.warning(f"无法导入matplotlib，跳过图表生成: {str(e)}")
+        return None
+    except Exception as e:
+        logging.warning(f"生成数据可视化时出错: {str(e)}")
+        return None
+
+
+def _dirichlet_partition_data(y_data, n_clients, n_classes, alpha, min_size=1, reference_distribution=None):
+    class_indices = [np.where(y_data == i)[0] for i in range(n_classes)]
+    client_data_indices = [[] for _ in range(n_clients)]
+
+    if reference_distribution is not None:
+        for class_id in range(n_classes):
+            class_idx = class_indices[class_id]
+            np.random.shuffle(class_idx)
+            proportions = reference_distribution[:, class_id]
+            proportions = proportions / (proportions.sum() + 1e-8)
+            expected = proportions * len(class_idx)
+            counts = np.floor(expected).astype(int)
+            remainder = int(len(class_idx) - counts.sum())
+            if remainder > 0:
+                frac = expected - counts
+                order = np.argsort(frac)[::-1]
+                counts[order[:remainder]] += 1
+
+            start_idx = 0
+            for client_id in range(n_clients):
+                end_idx = start_idx + int(counts[client_id])
+                client_data_indices[client_id].extend(class_idx[start_idx:end_idx])
+                start_idx = end_idx
     else:
-        traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+        for class_id in range(n_classes):
+            class_idx = class_indices[class_id]
+            np.random.shuffle(class_idx)
+            proportions = np.random.dirichlet(np.repeat(alpha, n_clients))
 
-    return X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts
+            min_samples_per_client = min(min_size, len(class_idx) // n_clients)
+            allocated_samples = 0
+
+            for client_id in range(n_clients):
+                if client_id == n_clients - 1:
+                    num_samples = len(class_idx) - allocated_samples
+                else:
+                    num_samples = max(
+                        min_samples_per_client, int(proportions[client_id] * len(class_idx))
+                    )
+                    remaining_clients = n_clients - client_id - 1
+                    remaining_min_samples = remaining_clients * min_samples_per_client
+                    available_samples = len(class_idx) - allocated_samples - remaining_min_samples
+                    num_samples = min(num_samples, available_samples)
+                    num_samples = max(num_samples, 0)
+
+                start_idx = allocated_samples
+                end_idx = start_idx + num_samples
+                client_data_indices[client_id].extend(class_idx[start_idx:end_idx])
+                allocated_samples += num_samples
+
+    net_dataidx_map = {}
+    for client_id in range(n_clients):
+        np.random.shuffle(client_data_indices[client_id])
+        net_dataidx_map[client_id] = client_data_indices[client_id]
+    return net_dataidx_map
+
+
+def partition_data_dirichlet(dataset, datadir, partition_method, n_nets, alpha):
+    X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
+    n_classes = 100
+
+    train_net_dataidx_map = {}
+    test_net_dataidx_map = {}
+
+    if partition_method == "hetero":
+        train_net_dataidx_map = _dirichlet_partition_data(
+            y_train, n_nets, n_classes, alpha, min_size=10
+        )
+        reference = _calculate_client_class_distributions(y_train, train_net_dataidx_map, n_classes)
+        test_net_dataidx_map = _dirichlet_partition_data(
+            y_test, n_nets, n_classes, alpha, min_size=5, reference_distribution=reference
+        )
+
+        _log_data_distribution_statistics(y_train, train_net_dataidx_map, n_classes, "CIFAR100训练集")
+        _log_data_distribution_statistics(y_test, test_net_dataidx_map, n_classes, "CIFAR100测试集")
+        _generate_data_distribution_visualization(y_train, train_net_dataidx_map, n_classes)
+
+    elif partition_method == "homo":
+        idxs = np.random.permutation(y_train.shape[0])
+        batch_idxs = np.array_split(idxs, n_nets)
+        train_net_dataidx_map = {i: batch_idxs[i].tolist() for i in range(n_nets)}
+
+        reference = _calculate_client_class_distributions(y_train, train_net_dataidx_map, n_classes)
+        test_net_dataidx_map = _dirichlet_partition_data(
+            y_test, n_nets, n_classes, alpha=1.0, min_size=1, reference_distribution=reference
+        )
+    else:
+        raise NotImplementedError
+
+    return X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map
+
+
+def partition_data(dataset, datadir, partition, n_nets, alpha):
+    if partition == "hetero-fix":
+        X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
+        n_classes = 100
+        dataidx_map_file_path = './data_preprocessing/non-iid-distribution/CIFAR100/net_dataidx_map.txt'
+        train_net_dataidx_map = read_net_dataidx_map(dataidx_map_file_path)
+        reference = _calculate_client_class_distributions(y_train, train_net_dataidx_map, n_classes)
+        test_net_dataidx_map = _dirichlet_partition_data(
+            y_test, n_nets, n_classes, alpha=1.0, min_size=1, reference_distribution=reference
+        )
+        _log_data_distribution_statistics(y_train, train_net_dataidx_map, n_classes, "CIFAR100训练集(hetero-fix)")
+        _log_data_distribution_statistics(y_test, test_net_dataidx_map, n_classes, "CIFAR100测试集(hetero-fix)")
+        _generate_data_distribution_visualization(y_train, train_net_dataidx_map, n_classes)
+        return X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map
+
+    return partition_data_dirichlet(dataset, datadir, partition, n_nets, alpha)
 
 
 # for centralized training
 def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None):
-    return get_dataloader_CIFAR100(datadir, train_bs, test_bs, dataidxs)
+    return get_dataloader_CIFAR100(datadir, train_bs, test_bs, dataidxs, None)
 
 
 # for local devices
@@ -169,13 +318,13 @@ def get_dataloader_test(dataset, datadir, train_bs, test_bs, dataidxs_train, dat
     return get_dataloader_test_CIFAR100(datadir, train_bs, test_bs, dataidxs_train, dataidxs_test)
 
 
-def get_dataloader_CIFAR100(datadir, train_bs, test_bs, dataidxs=None):
+def get_dataloader_CIFAR100(datadir, train_bs, test_bs, train_dataidxs=None, test_dataidxs=None):
     dl_obj = CIFAR100_truncated
 
     transform_train, transform_test = _data_transforms_cifar100()
 
-    train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=True)
-    test_ds = dl_obj(datadir, train=False, transform=transform_test, download=True)
+    train_ds = dl_obj(datadir, dataidxs=train_dataidxs, train=True, transform=transform_train, download=True)
+    test_ds = dl_obj(datadir, dataidxs=test_dataidxs, train=False, transform=transform_test, download=True)
 
     train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True)
     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True)
@@ -199,14 +348,11 @@ def get_dataloader_test_CIFAR100(datadir, train_bs, test_bs, dataidxs_train=None
 
 def load_partition_data_distributed_cifar100(process_id, dataset, data_dir, partition_method, partition_alpha,
                                             client_number, batch_size):
-    X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(dataset,
-                                                                                             data_dir,
-                                                                                             partition_method,
-                                                                                             client_number,
-                                                                                             partition_alpha)
+    X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map = partition_data(
+        dataset, data_dir, partition_method, client_number, partition_alpha
+    )
     class_num = len(np.unique(y_train))
-    logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
-    train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
+    train_data_num = sum([len(train_net_dataidx_map[r]) for r in range(client_number)])
 
     # get global test data
     batch_size_test = 100 # make all test on similar batch size
@@ -219,12 +365,14 @@ def load_partition_data_distributed_cifar100(process_id, dataset, data_dir, part
         local_data_num = 0
     else:
         # get local dataset
-        dataidxs = net_dataidx_map[process_id - 1]
-        local_data_num = len(dataidxs)
+        train_dataidxs = train_net_dataidx_map[process_id - 1]
+        test_dataidxs = test_net_dataidx_map[process_id - 1]
+        local_data_num = len(train_dataidxs)
         logging.info("rank = %d, local_sample_number = %d" % (process_id, local_data_num))
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader(dataset, data_dir, batch_size, batch_size_test,
-                                                 dataidxs)
+        train_data_local, test_data_local = get_dataloader_CIFAR100(
+            data_dir, batch_size, batch_size_test, train_dataidxs, test_dataidxs
+        )
         logging.info("process_id = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             process_id, len(train_data_local), len(test_data_local)))
         train_data_global = None
@@ -234,21 +382,18 @@ def load_partition_data_distributed_cifar100(process_id, dataset, data_dir, part
 
 
 def load_partition_data_cifar100(dataset, data_dir, partition_method, partition_alpha, client_number, batch_size):
-    X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(dataset,
-                                                                                             data_dir,
-                                                                                             partition_method,
-                                                                                             client_number,
-                                                                                             partition_alpha)
+    X_train, y_train, X_test, y_test, train_net_dataidx_map, test_net_dataidx_map = partition_data(
+        dataset, data_dir, partition_method, client_number, partition_alpha
+    )
     class_num = len(np.unique(y_train))
-    logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
-    train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
+    train_data_num = sum([len(train_net_dataidx_map[r]) for r in range(client_number)])
     
     batch_size_test = 100 # make all test on similar batch size
 
-    train_data_global, test_data_global = get_dataloader(dataset, data_dir, batch_size, batch_size_test)
+    train_data_global, test_data_global = get_dataloader_CIFAR100(data_dir, batch_size, batch_size_test)
     logging.info("train_dl_global number = " + str(len(train_data_global)))
     logging.info("test_dl_global number = " + str(len(train_data_global)))
-    test_data_num = len(test_data_global)
+    test_data_num = sum([len(test_net_dataidx_map[r]) for r in range(client_number)])
 
     # get local dataset
     data_local_num_dict = dict()
@@ -256,14 +401,16 @@ def load_partition_data_cifar100(dataset, data_dir, partition_method, partition_
     test_data_local_dict = dict()
 
     for client_idx in range(client_number):
-        dataidxs = net_dataidx_map[client_idx]
-        local_data_num = len(dataidxs)
+        train_dataidxs = train_net_dataidx_map[client_idx]
+        test_dataidxs = test_net_dataidx_map[client_idx]
+        local_data_num = len(train_dataidxs)
         data_local_num_dict[client_idx] = local_data_num
         logging.info("client_idx = %d, local_sample_number = %d" % (client_idx, local_data_num))
 
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader(dataset, data_dir, batch_size, batch_size_test,
-                                                 dataidxs)
+        train_data_local, test_data_local = get_dataloader_CIFAR100(
+            data_dir, batch_size, batch_size_test, train_dataidxs, test_dataidxs
+        )
         logging.info("client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             client_idx, len(train_data_local), len(test_data_local)))
         train_data_local_dict[client_idx] = train_data_local

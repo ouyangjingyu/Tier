@@ -204,9 +204,66 @@ def partition_data(dataset, datadir, partition, n_nets, alpha):
     return X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts
 
 
+def _calculate_client_class_distributions(y_data, net_dataidx_map, n_classes):
+    n_clients = len(net_dataidx_map)
+    distributions = np.zeros((n_clients, n_classes), dtype=np.int64)
+    for client_id, data_indices in net_dataidx_map.items():
+        if len(data_indices) == 0:
+            continue
+        client_labels = y_data[np.array(data_indices)]
+        for class_id in range(n_classes):
+            distributions[int(client_id), class_id] = int(np.sum(client_labels == class_id))
+    return distributions
+
+
+def _create_test_net_dataidx_map(y_test, reference_distribution, min_size=1):
+    n_clients, n_classes = reference_distribution.shape
+    class_indices = [np.where(y_test == i)[0] for i in range(n_classes)]
+    client_data_indices = [[] for _ in range(n_clients)]
+
+    for class_id in range(n_classes):
+        class_idx = class_indices[class_id]
+        np.random.shuffle(class_idx)
+
+        proportions = reference_distribution[:, class_id].astype(np.float64)
+        if proportions.sum() <= 0:
+            proportions = np.ones(n_clients, dtype=np.float64)
+        proportions = proportions / (proportions.sum() + 1e-8)
+
+        expected = proportions * len(class_idx)
+        counts = np.floor(expected).astype(int)
+        remainder = int(len(class_idx) - counts.sum())
+        if remainder > 0:
+            frac = expected - counts
+            order = np.argsort(frac)[::-1]
+            counts[order[:remainder]] += 1
+
+        start = 0
+        for client_id in range(n_clients):
+            end = start + int(counts[client_id])
+            client_data_indices[client_id].extend(class_idx[start:end])
+            start = end
+
+    for client_id in range(n_clients):
+        np.random.shuffle(client_data_indices[client_id])
+
+    if min_size > 0:
+        sizes = np.array([len(x) for x in client_data_indices], dtype=int)
+        for client_id in range(n_clients):
+            while len(client_data_indices[client_id]) < min_size:
+                donor = int(np.argmax(sizes))
+                if sizes[donor] <= min_size:
+                    break
+                client_data_indices[client_id].append(client_data_indices[donor].pop())
+                sizes[client_id] += 1
+                sizes[donor] -= 1
+
+    return {i: client_data_indices[i] for i in range(n_clients)}
+
+
 # for centralized training
 def get_dataloader(dataset, datadir, train_bs, test_bs, dataidxs=None):
-    return get_dataloader_cinic10(datadir, train_bs, test_bs, dataidxs)
+    return get_dataloader_cinic10(datadir, train_bs, test_bs, dataidxs, None)
 
 
 # for local devices
@@ -214,7 +271,7 @@ def get_dataloader_test(dataset, datadir, train_bs, test_bs, dataidxs_train, dat
     return get_dataloader_test_cinic10(datadir, train_bs, test_bs, dataidxs_train, dataidxs_test)
 
 
-def get_dataloader_cinic10(datadir, train_bs, test_bs, dataidxs=None):
+def get_dataloader_cinic10(datadir, train_bs, test_bs, train_dataidxs=None, test_dataidxs=None):
     dl_obj = ImageFolderTruncated
 
     transform_train, transform_test = _data_transforms_cinic10()
@@ -222,8 +279,8 @@ def get_dataloader_cinic10(datadir, train_bs, test_bs, dataidxs=None):
     traindir = os.path.join(datadir, 'train')
     valdir = os.path.join(datadir, 'test')
 
-    train_ds = dl_obj(traindir, dataidxs=dataidxs, transform=transform_train)
-    test_ds = dl_obj(valdir, transform=transform_train)
+    train_ds = dl_obj(traindir, dataidxs=train_dataidxs, transform=transform_train)
+    test_ds = dl_obj(valdir, dataidxs=test_dataidxs, transform=transform_test)
 
     train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True)
     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True)
@@ -257,6 +314,8 @@ def load_partition_data_distributed_cinic10(process_id, dataset, data_dir, parti
     class_num = len(np.unique(y_train))
     logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
     train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
+    reference = _calculate_client_class_distributions(y_train, net_dataidx_map, class_num)
+    test_net_dataidx_map = _create_test_net_dataidx_map(y_test, reference, min_size=1)
 
     # get global test data
     if process_id == 0:
@@ -269,12 +328,14 @@ def load_partition_data_distributed_cinic10(process_id, dataset, data_dir, parti
         local_data_num = 0
     else:
         # get local dataset
-        dataidxs = net_dataidx_map[process_id - 1]
-        local_data_num = len(dataidxs)
+        train_dataidxs = net_dataidx_map[process_id - 1]
+        test_dataidxs = test_net_dataidx_map[process_id - 1]
+        local_data_num = len(train_dataidxs)
         logging.info("rank = %d, local_sample_number = %d" % (process_id, local_data_num))
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader(dataset, data_dir, batch_size, batch_size,
-                                                           dataidxs)
+        train_data_local, test_data_local = get_dataloader_cinic10(
+            data_dir, batch_size, batch_size, train_dataidxs, test_dataidxs
+        )
         logging.info("process_id = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             process_id, len(train_data_local), len(test_data_local)))
         test_data_num = 0
@@ -293,11 +354,13 @@ def load_partition_data_cinic10(dataset, data_dir, partition_method, partition_a
     class_num = len(np.unique(y_train))
     logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
     train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
+    reference = _calculate_client_class_distributions(y_train, net_dataidx_map, class_num)
+    test_net_dataidx_map = _create_test_net_dataidx_map(y_test, reference, min_size=1)
 
     train_data_global, test_data_global = get_dataloader(dataset, data_dir, batch_size, batch_size)
     logging.info("train_dl_global number = " + str(len(train_data_global)))
     logging.info("test_dl_global number = " + str(len(train_data_global)))
-    test_data_num = len(test_data_global)
+    test_data_num = sum([len(test_net_dataidx_map[r]) for r in range(client_number)])
 
     # get local dataset
     data_local_num_dict = dict()
@@ -305,14 +368,16 @@ def load_partition_data_cinic10(dataset, data_dir, partition_method, partition_a
     test_data_local_dict = dict()
 
     for client_idx in range(client_number):
-        dataidxs = net_dataidx_map[client_idx]
-        local_data_num = len(dataidxs)
+        train_dataidxs = net_dataidx_map[client_idx]
+        test_dataidxs = test_net_dataidx_map[client_idx]
+        local_data_num = len(train_dataidxs)
         data_local_num_dict[client_idx] = local_data_num
         logging.info("client_idx = %d, local_sample_number = %d" % (client_idx, local_data_num))
 
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader(dataset, data_dir, batch_size, batch_size,
-                                                           dataidxs)
+        train_data_local, test_data_local = get_dataloader_cinic10(
+            data_dir, batch_size, batch_size, train_dataidxs, test_dataidxs
+        )
         logging.info("client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             client_idx, len(train_data_local), len(test_data_local)))
         train_data_local_dict[client_idx] = train_data_local
